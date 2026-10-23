@@ -1,3 +1,14 @@
 spring:
   application:
-    name: demo
+    name: meet-reserve
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/meet-service}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:pass}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  liquibase:
+    enabled: true
+    change-log: classpath:db/changelog/db.changelog-master.yaml
+    drop-first: false
