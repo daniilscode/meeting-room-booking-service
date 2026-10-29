@@ -1,0 +1,123 @@
+﻿openapi: 3.0.3
+info:
+  title: MeetReserve API
+  version: 1.0.0
+  description: API для создания временной брони переговорной комнаты.
+servers:
+  - url: http://localhost:8080
+    description: Локальный сервер
+
+tags:
+  - name: Bookings
+    description: Создание и управление бронированиями
+
+paths:
+  /api/v1/bookings:
+    post:
+      tags: [Bookings]
+      operationId: createPendingBooking
+      summary: Создать временную бронь
+      description: Создаёт бронь со статусом PENDING на 10 минут до подтверждения.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+      responses:
+        '201':
+          description: Бронь создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingResponse'
+        '400':
+          description: Некорректные данные запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Комната не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Комната неактивна или интервал занят
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    CreateBookingRequest:
+      type: object
+      required: [roomId, userId, title, startTime, endTime]
+      properties:
+        roomId:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 1
+        userId:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 42
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+          example: Архитектурный комитет
+        startTime:
+          type: string
+          format: date-time
+          example: '2026-11-01T14:00:00Z'
+        endTime:
+          type: string
+          format: date-time
+          example: '2026-11-01T15:00:00Z'
+    BookingResponse:
+      type: object
+      required: [id, roomId, userId, title, startTime, endTime, status, expiresAt, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        roomId:
+          type: integer
+          format: int64
+        userId:
+          type: integer
+          format: int64
+        title:
+          type: string
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [PENDING, CONFIRMED, CANCELLED, EXPIRED]
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    ErrorResponse:
+      type: object
+      required: [code, message, timestamp]
+      properties:
+        code:
+          type: string
+          example: SLOT_ALREADY_BOOKED
+        message:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
