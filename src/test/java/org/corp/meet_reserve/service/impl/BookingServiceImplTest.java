@@ -10,6 +10,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import org.corp.meet_reserve.entity.Booking;
 import org.corp.meet_reserve.entity.Room;
 import org.corp.meet_reserve.exception.RoomAlreadyBookedException;
+import org.corp.meet_reserve.exception.RoomInactiveException;
 import org.corp.meet_reserve.exception.RoomNotFoundException;
 import org.corp.meet_reserve.repository.BookingRepository;
 import org.corp.meet_reserve.repository.RoomRepository;
@@ -18,7 +19,8 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
-import java.time.LocalDateTime;
+import java.time.Clock;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -46,12 +48,14 @@ class BookingServiceImplTest {
     @Mock RoomRepository roomRepository;
     @Mock StringRedisTemplate redisTemplate;
     @Mock ValueOperations<String, String> valueOperations;
+    @Mock Clock clock;
     @InjectMocks BookingServiceImpl service;
 
     @org.junit.jupiter.api.BeforeEach
     void setUpRedis() {
         org.mockito.Mockito.lenient().when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         org.mockito.Mockito.lenient().when(valueOperations.setIfAbsent(any(), any(), any(java.time.Duration.class))).thenReturn(true);
+        org.mockito.Mockito.lenient().when(clock.instant()).thenAnswer(invocation -> Instant.now());
     }
 
     private final OffsetDateTime start = OffsetDateTime.now(ZoneOffset.UTC).plusHours(1).withSecond(0).withNano(0);
@@ -63,10 +67,10 @@ class BookingServiceImplTest {
         when(roomRepository.findById(1L)).thenReturn(Optional.of(room));
         when(bookingRepository.findByRoomIdAndStatusInAndStartTimeLessThanAndEndTimeGreaterThan(anyLong(), any(), any(), any()))
                 .thenReturn(List.of());
-        when(bookingRepository.save(any(Booking.class))).thenAnswer(invocation -> {
+        when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(invocation -> {
             Booking booking = invocation.getArgument(0);
             booking.setId(UUID.randomUUID());
-            booking.setCreatedAt(LocalDateTime.now());
+            booking.setCreatedAt(Instant.now());
             return booking;
         });
 
@@ -75,7 +79,7 @@ class BookingServiceImplTest {
         assertThat(response.getStatus()).isEqualTo(org.corp.meet_reserve.api.model.BookingResponse.StatusEnum.PENDING);
         assertThat(response.getRoomId()).isEqualTo(1L);
         assertThat(response.getExpiresAt()).isNotNull();
-        verify(bookingRepository).save(any(Booking.class));
+        verify(bookingRepository).saveAndFlush(any(Booking.class));
     }
 
     @Test
@@ -96,10 +100,10 @@ class BookingServiceImplTest {
         AtomicBoolean slotClaimed = new AtomicBoolean();
         when(bookingRepository.findByRoomIdAndStatusInAndStartTimeLessThanAndEndTimeGreaterThan(anyLong(), any(), any(), any()))
                 .thenAnswer(invocation -> slotClaimed.compareAndSet(false, true) ? List.of() : List.of(new Booking()));
-        when(bookingRepository.save(any(Booking.class))).thenAnswer(invocation -> {
+        when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(invocation -> {
             Booking booking = invocation.getArgument(0);
             booking.setId(UUID.randomUUID());
-            booking.setCreatedAt(LocalDateTime.now());
+            booking.setCreatedAt(Instant.now());
             return booking;
         });
 
@@ -140,7 +144,7 @@ class BookingServiceImplTest {
         when(roomRepository.findById(1L)).thenReturn(Optional.of(room(1L, false)));
 
         assertThatThrownBy(() -> service.createPendingBooking(request()))
-                .isInstanceOf(IllegalStateException.class);
+                .isInstanceOf(RoomInactiveException.class);
         verifyNoInteractions(bookingRepository);
     }
 
@@ -152,7 +156,7 @@ class BookingServiceImplTest {
 
         assertThatThrownBy(() -> service.createPendingBooking(request()))
                 .isInstanceOf(RoomAlreadyBookedException.class);
-        verify(bookingRepository, never()).save(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -161,7 +165,7 @@ class BookingServiceImplTest {
         when(roomRepository.findById(1L)).thenReturn(Optional.of(room));
         when(bookingRepository.findByRoomIdAndStatusInAndStartTimeLessThanAndEndTimeGreaterThan(anyLong(), any(), any(), any()))
                 .thenReturn(List.of());
-        when(bookingRepository.save(any(Booking.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
         assertThatCode(() -> service.createPendingBooking(request())).doesNotThrowAnyException();
     }
@@ -178,6 +182,26 @@ class BookingServiceImplTest {
     @Test
     void rejectsTooShortBooking() {
         CreateBookingRequest invalid = new CreateBookingRequest(1L, 42L, "Test", start, start.plusMinutes(10));
+
+        assertThatThrownBy(() -> service.createPendingBooking(invalid))
+                .isInstanceOf(IllegalArgumentException.class);
+        verifyNoInteractions(roomRepository, bookingRepository);
+    }
+
+    @Test
+    void rejectsBookingInThePast() {
+        CreateBookingRequest invalid = new CreateBookingRequest(
+                1L, 42L, "Test", OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(1), end);
+
+        assertThatThrownBy(() -> service.createPendingBooking(invalid))
+                .isInstanceOf(IllegalArgumentException.class);
+        verifyNoInteractions(roomRepository, bookingRepository);
+    }
+
+    @Test
+    void rejectsBookingLongerThanFourHours() {
+        CreateBookingRequest invalid = new CreateBookingRequest(
+                1L, 42L, "Test", start, start.plusHours(4).plusSeconds(1));
 
         assertThatThrownBy(() -> service.createPendingBooking(invalid))
                 .isInstanceOf(IllegalArgumentException.class);

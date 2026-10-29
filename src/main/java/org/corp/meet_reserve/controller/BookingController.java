@@ -1,5 +1,4 @@
 package org.corp.meet_reserve.controller;
-import org.corp.meet_reserve.api.BookingsApi;
 import org.corp.meet_reserve.api.model.BookingResponse;
 import org.corp.meet_reserve.api.model.CreateBookingRequest;
 

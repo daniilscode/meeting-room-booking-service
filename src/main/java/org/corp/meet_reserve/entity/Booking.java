@@ -9,6 +9,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
 import lombok.AccessLevel;
 import lombok.AllArgsConstructor;
@@ -17,10 +18,7 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 import lombok.experimental.FieldDefaults;
 
-import lombok.experimental.FieldDefaults;
-import org.hibernate.annotations.CreationTimestamp;
-
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.UUID;
 
 @Entity
@@ -47,20 +45,26 @@ public class Booking {
     String title;
 
     @Column(name = "start_time", nullable = false)
-    LocalDateTime startTime;
+    Instant startTime;
 
     @Column(name = "end_time", nullable = false)
-    LocalDateTime endTime;
+    Instant endTime;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 32)
     BookingStatus status = BookingStatus.PENDING;
 
     @Column(name = "expires_at")
-    LocalDateTime expiresAt;
+    Instant expiresAt;
 
-    @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
-    LocalDateTime createdAt;
+    Instant createdAt;
+
+    @PrePersist
+    void assignCreatedAtIfMissing() {
+        if (createdAt == null) {
+            createdAt = Instant.now();
+        }
+    }
 
 }

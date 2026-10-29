@@ -7,7 +7,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
@@ -24,15 +24,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     List<Booking> findByRoomIdAndStatusInAndStartTimeLessThanAndEndTimeGreaterThan(
             @Param("roomId") Long roomId,
             @Param("statuses") Collection<BookingStatus> statuses,
-            @Param("endTime") LocalDateTime endTime,
-            @Param("startTime") LocalDateTime startTime);
+            @Param("endTime") Instant endTime,
+            @Param("startTime") Instant startTime);
 
-    @Modifying
+    @Modifying(flushAutomatically = true)
     @Query("""
             UPDATE Booking b
-            SET b.status = 'EXPIRED'
-            WHERE b.status = 'PENDING'
+            SET b.status = :expiredStatus
+            WHERE b.status = :pendingStatus
               AND b.expiresAt <= :now
             """)
-    int expireOverdueBookings(@Param("now") LocalDateTime now);
+    int expireOverdueBookings(
+            @Param("now") Instant now,
+            @Param("pendingStatus") BookingStatus pendingStatus,
+            @Param("expiredStatus") BookingStatus expiredStatus);
 }
