@@ -1,0 +1,460 @@
+Вот подробная инженерная техническая спецификация (Tech Spec) для проекта
+MeetReserve (Meeting Room Booking Service).
+
+Она составлена так, чтобы ты мог положить её перед собой и писать код шаг за
+шагом, избегая классических граблей многопоточности и транзакций.
+
+Техническая спецификация: MeetReserve Backend
+
+1. Архитектура и структура пакетов (Layered Architecture)
+
+Сервис строится по классической слоистой архитектуре с четким разделением
+ответственности:
+
+src/main/java/com/daniil/meetreserve/
+├── config/                  # Конфигурация Redisson, OpenAPI/Swagger, Async/Scheduler
+│   ├── RedissonConfig.java
+│   └── OpenApiConfig.java
+├── controller/              # REST контроллеры
+│   ├── RoomController.java
+│   └── BookingController.java
+├── dto/                     # Request / Response DTO и валидации
+│   ├── request/
+│   │   ├── CreateBookingRequest.java
+│   │   └── SearchAvailableRoomsRequest.java
+│   └── response/
+│       ├── BookingResponse.java
+│       └── RoomResponse.java
+├── entity/                  # JPA сущности
+│   ├── Room.java
+│   ├── Booking.java
+│   └── BookingStatus.java   # PENDING, CONFIRMED, CANCELLED, EXPIRED
+├── exception/               # Кастомные исключения и GlobalExceptionHandler
+│   ├── RoomAlreadyBookedException.java
+│   ├── BookingNotFoundException.java
+│   ├── BookingExpiredException.java
+│   └── GlobalExceptionHandler.java
+├── repository/              # Spring Data JPA репозитории
+│   ├── RoomRepository.java
+│   └── BookingRepository.java
+└── service/                 # Бизнес-логика и управление блокировками
+    ├── RoomService.java
+    ├── BookingService.java
+    ├── BookingLockManager.java     # Инкапсуляция логики Redisson Distributed Lock
+    └── BookingExpirationScheduler.java # Очистка просроченных броней
+
+2. Схема базы данных и миграции (Liquibase)
+
+2.1. Changelog: db/changelog/changes/001-initial-schema.sql
+
+-- 1. Подключаем расширение для поддержки Exclusion Constraints по равенству и пересечению интервалов
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+-- 2. Таблица переговорных
+CREATE TABLE rooms (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    capacity INT NOT NULL CHECK (capacity > 0),
+    has_projector BOOLEAN NOT NULL DEFAULT FALSE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- 3. Таблица бронирований
+CREATE TABLE bookings (
+    id UUID PRIMARY KEY,
+    room_id BIGINT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    start_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    end_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    status VARCHAR(32) NOT NULL, -- PENDING, CONFIRMED, CANCELLED, EXPIRED
+    expires_at TIMESTAMP WITH TIME ZONE, -- Заполняется только для PENDING (NOW + 10 min)
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+
+    -- Ограничение: конец брони всегда строго позже начала
+    CONSTRAINT chk_booking_time_valid CHECK (end_time > start_time)
+);
+
+-- 4. Индекс для быстрого поиска наложений и очистки шедулером
+CREATE INDEX idx_bookings_lookup
+ON bookings (room_id, status, start_time, end_time);
+
+CREATE INDEX idx_bookings_expired_cleanup
+ON bookings (status, expires_at)
+WHERE status = 'PENDING';
+
+-- 5. Защита на уровне ядра PostgreSQL (железная страховка от овербукинга для CONFIRMED)
+ALTER TABLE bookings ADD CONSTRAINT no_overlapping_confirmed_bookings
+EXCLUDE USING gist (
+    room_id WITH =,
+    tstzrange(start_time, end_time) WITH &&
+) WHERE (status = 'CONFIRMED');
+
+3. Критический момент: Lock vs Transaction (Паттерн работы с Redisson)
+
+⚠️ Главная ловушка на собеседованиях:
+Если повесить @Transactional на метод, внутри которого берется lock.lock(), то
+блокировка снимется ДО того, как транзакция закоммитится в PostgreSQL. В этот
+микроинтервал времени параллельный поток успеет прочитать старые данные и
+произойдет овербукинг!
+
+Правильный алгоритм (Lock ОБОРАЧИВАЕТ транзакцию):
+
+Поток А                                     Поток Б
+   │                                           │
+   ▼                                           ▼
+1. Захват Redisson Lock                     1. Попытка захвата Redisson Lock
+   `lock:room:{roomId}:{date}`                 └── (Ждет до 2 секунд...)
+   │
+2. Старт БД-транзакции
+   │
+3. Проверка overlap в Postgres
+   │
+4. Сохранение `status = PENDING`
+   │
+5. Коммит транзакции в Postgres
+   │
+6. Освобождение Redisson Lock ──────────────► 2. Захват освободившегося Lock
+                                              3. Старт БД-транзакции
+                                              4. Проверка overlap в Postgres
+                                                 └── Находит бронь Потока А!
+                                              5. Rollback + Выброс 409 Conflict
+                                              6. Освобождение Lock
+
+Реализация BookingLockManager.java:
+
+@Component
+@RequiredArgsConstructor
+public class BookingLockManager {
+
+    private final RedissonClient redissonClient;
+
+    public <T> T executeWithLock(Long roomId, LocalDate date, Supplier<T> action) {
+        String lockKey = String.format("lock:room:%d:%s", roomId, date.toString());
+        RLock lock = redissonClient.getLock(lockKey);
+
+        try {
+            // Ждем максимум 2 секунды, удерживаем 5 секунд (auto-release safety)
+            boolean acquired = lock.tryLock(2, 5, TimeUnit.SECONDS);
+            if (!acquired) {
+                throw new RoomAlreadyBookedException("Комната в данный момент обрабатывается другим запросом. Повторите попытку.");
+            }
+            return action.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Прервано ожидание блокировки", e);
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}
+
+4. Спецификация REST API
+
+4.1. Временное бронирование слота (Hold / Draft)
+
+Клиент выбирает время и «замораживает» переговорку на 10 минут.
+
+  - URL: POST /api/v1/bookings
+  - Request:
+
+{
+  "roomId": 1,
+  "userId": 42,
+  "title": "Архитектурный комитет",
+  "startTime": "2026-11-01T14:00:00Z",
+  "endTime": "2026-11-01T15:00:00Z"
+}
+
+  - Валидация:
+      - startTime строго в будущем (@Future).
+      - endTime строго позже startTime.
+      - Минимальная длительность: 15 минут, максимальная: 4 часа.
+  - Response 201 Created:
+
+{
+  "id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+  "roomId": 1,
+  "userId": 42,
+  "title": "Архитектурный комитет",
+  "startTime": "2026-11-01T14:00:00Z",
+  "endTime": "2026-11-01T15:00:00Z",
+  "status": "PENDING",
+  "expiresAt": "2026-11-01T13:10:00Z"
+}
+
+  - Ошибки:
+      - 400 Bad Request — невалидные временные границы.
+      - 404 Not Found — комната не существует или не активна.
+      - 409 Conflict — комната уже занята на этот интервал:
+        {
+          "code": "SLOT_ALREADY_BOOKED",
+          "message": "Выбранный интервал пересекается с существующей активной бронью"
+        }
+
+4.2. Подтверждение брони (Confirm)
+
+Пользователь заполнил адженду и подтвердил встречу.
+
+  - URL: POST /api/v1/bookings/{id}/confirm
+  - Response 200 OK:
+
+{
+  "id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+  "status": "CONFIRMED",
+  "expiresAt": null
+}
+
+  - Ошибки:
+      - 410 Gone — бронь истекла (прошло более 10 минут) и статус уже сменился
+        на EXPIRED.
+
+4.3. Отмена брони (Cancel)
+
+  - URL: DELETE /api/v1/bookings/{id}
+  - Response 204 No Content
+  - Логика: переводит бронь в статус CANCELLED. Слот мгновенно становится
+    доступен для других сотрудников.
+
+4.4. Таймлайн комнаты на выбранный день
+
+Для отрисовки календаря на фронтенде.
+
+  - URL: GET /api/v1/rooms/{roomId}/timeline?date=2026-11-01
+  - Response 200 OK:
+
+{
+  "roomId": 1,
+  "date": "2026-11-01",
+  "slots": [
+    {
+      "bookingId": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+      "startTime": "2026-11-01T10:00:00Z",
+      "endTime": "2026-11-01T11:00:00Z",
+      "status": "CONFIRMED"
+    },
+    {
+      "bookingId": "c1aebc99-1c0b-4ef8-bb6d-6bb9bd380a22",
+      "startTime": "2026-11-01T14:00:00Z",
+      "endTime": "2026-11-01T14:30:00Z",
+      "status": "PENDING"
+    }
+  ]
+}
+
+5. Механизм фоновой очистки (Scheduler)
+
+Сервис раз в минуту сканирует зависшие временные брони:
+
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class BookingExpirationScheduler {
+
+    private final BookingRepository bookingRepository;
+
+    @Scheduled(fixedDelay = 60000) // каждую минуту
+    @Transactional
+    public void cleanupExpiredBookings() {
+        Instant now = Instant.now();
+        int updatedCount = bookingRepository.expireOverdueBookings(now);
+        if (updatedCount > 0) {
+            log.info("Очищено просроченных броней со статусом PENDING: {}", updatedCount);
+        }
+    }
+}
+
+Репозиторий:
+
+@Modifying
+@Query("""
+    UPDATE Booking b
+    SET b.status = 'EXPIRED'
+    WHERE b.status = 'PENDING'
+      AND b.expiresAt <= :now
+""")
+int expireOverdueBookings(@Param("now") Instant now);
+
+6. Золотой стандарт для резюме: Интеграционный тест многопоточности
+
+Этот тест доказывает техлиду, что код реально держит конкурентные нагрузки:
+
+@SpringBootTest
+@Testcontainers
+class BookingConcurrencyTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Container
+    static GenericContainer<?> redis = new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
+
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+        registry.add("spring.data.redis.host", redis::getHost);
+        registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+    }
+
+    @Autowired
+    private BookingService bookingService;
+
+    @Test
+    void shouldAllowOnlyOneBookingWhenMultipleThreadsTryConcurrently() throws InterruptedException {
+        int threadsCount = 20;
+        ExecutorService executorService = Executors.newFixedThreadPool(threadsCount);
+        CountDownLatch latch = new CountDownLatch(1); // для одновременного старта всех 20 потоков
+
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger conflictCount = new AtomicInteger(0);
+
+        CreateBookingRequest request = new CreateBookingRequest(
+                1L, 100L, "Sprint Review",
+                Instant.parse("2026-11-01T10:00:00Z"),
+                Instant.parse("2026-11-01T11:00:00Z")
+        );
+
+        for (int i = 0; i < threadsCount; i++) {
+            executorService.submit(() -> {
+                try {
+                    latch.await(); // все потоки ждут этого момента
+                    bookingService.createPendingBooking(request);
+                    successCount.incrementAndGet();
+                } catch (RoomAlreadyBookedException e) {
+                    conflictCount.incrementAndGet();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            });
+        }
+
+        // Запуск всех 20 потоков в одну и ту же миллисекунду
+        latch.countDown();
+        executorService.shutdown();
+        executorService.awaitTermination(10, TimeUnit.SECONDS);
+
+        // ПРОВЕРКА: ровно 1 бронь успешна, остальные 19 получили отказ
+        assertThat(successCount.get()).isEqualTo(1);
+        assertThat(conflictCount.get()).isEqualTo(19);
+    }
+}
+
+7. Файлы окружения
+
+docker-compose.yml (для локального запуска и проверки)
+
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: meet-reserve-postgres
+    environment:
+      POSTGRES_DB: meet_reserve_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: meet-reserve-redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:
+
+План действий по сборке MVP:
+
+1.  Запусти docker-compose up -d.
+2.  Подключи зависимости: spring-boot-starter-data-jpa,
+    redisson-spring-boot-starter, liquibase-core,
+    spring-boot-starter-validation, springdoc-openapi-starter-webmvc-ui.
+3.  Создай таблицы через Liquibase.
+4.  Напиши сущности Room и Booking.
+5.  Реализуй BookingLockManager + метод создания брони в BookingService.
+6.  Напиши интеграционный тест с Testcontainers. Как только увидишь заветный
+    зеленый чекбокс на тесте с 20 потоками — проект можно смело оформлять в
+    портфолио!
+
+8. Логика работы приложения
+
+8.1. Жизненный цикл бронирования
+
+Booking создаётся только для существующей активной комнаты. Начальное состояние новой брони — PENDING.
+При создании сервер генерирует UUID, сохраняет время создания и устанавливает expiresAt = createdAt + 10 minutes.
+Бронь должна иметь startTime раньше endTime, длительность от 15 минут до 4 часов, а начало бронирования не может быть в прошлом.
+
+Переходы состояний:
+- PENDING -> CONFIRMED: пользователь подтвердил бронь до истечения expiresAt.
+- PENDING -> CANCELLED: пользователь отменил бронь.
+- PENDING -> EXPIRED: фоновый планировщик обнаружил истёкший expiresAt.
+- CONFIRMED -> CANCELLED: пользователь отменил подтверждённую бронь.
+- CONFIRMED, CANCELLED, EXPIRED являются конечными состояниями для текущего сценария; повторное подтверждение или отмена не меняют запись.
+
+8.2. Создание временной брони
+
+1. BookingService валидирует входные данные.
+2. Проверяет, что комната существует и active = true.
+3. Приобретает распределённую блокировку Redis с ключом booking:room:{roomId}.
+4. Внутри одной транзакции повторно проверяет пересечения интервала с бронями этой комнаты в состояниях PENDING и CONFIRMED. CANCELLED и EXPIRED не блокируют слот.
+5. При отсутствии пересечения создаёт Booking со статусом PENDING и expiresAt = текущий момент + 10 минут.
+6. Фиксирует транзакцию и освобождает блокировку в блоке finally.
+
+Если блокировку получить не удалось или интервал уже занят, сервис возвращает 409 Conflict с кодом SLOT_ALREADY_BOOKED.
+Проверка пересечения выполняется как startTime < existing.endTime AND endTime > existing.startTime;
+соприкасающиеся интервалы (10:00–11:00 и 11:00–12:00) разрешены.
+
+8.3. Подтверждение брони
+
+Подтвердить можно только существующую бронь со статусом PENDING.
+Сервис проверяет expiresAt > now, снова захватывает блокировку комнаты и в транзакции проверяет отсутствие подтверждённого пересечения.
+После успешной проверки меняет статус на CONFIRMED и очищает expiresAt. Просроченная бронь переводится в EXPIRED и возвращает 410 Gone.
+Бронь другого состояния возвращает 409 Conflict.
+
+8.4. Отмена брони
+
+Отменить бронь может её владелец (userId совпадает с пользователем запроса). Владелец и статус проверяются до изменения.
+Для PENDING и CONFIRMED статус меняется на CANCELLED. Повторная отмена идемпотентна и возвращает успешный результат.
+Если запись не найдена, возвращается 404 Not Found; если пользователь не владеет записью — 403 Forbidden.
+
+8.5. Поиск доступных комнат
+
+Запрос доступности принимает интервал времени, требуемую вместимость и необязательный признак проектора.
+Возвращаются только комнаты с active = true и capacity >= requestedCapacity.
+Комната исключается, если существует PENDING или CONFIRMED бронь, пересекающая запрошенный интервал.
+Перед поиском планировщик или сервис может очистить просроченные PENDING-брони.
+
+8.6. Таймлайн комнаты
+
+Таймлайн загружает все брони комнаты, пересекающие календарный день, кроме CANCELLED и EXPIRED.
+В ответе записи сортируются по startTime и содержат bookingId, startTime, endTime и status. Несуществующая комната возвращает 404 Not Found.
+
+8.7. Очистка просроченных броней
+
+BookingExpirationScheduler запускается раз в минуту. В транзакции выполняется массовый UPDATE: все записи со статусом PENDING и expiresAt <= now переводятся в EXPIRED.
+Операция должна быть идемпотентной и возвращать количество изменённых строк. Планировщик не изменяет CONFIRMED, CANCELLED и уже EXPIRED записи.
+
+8.8. Транзакции и конкурентный доступ
+
+Методы изменения Booking выполняются в @Transactional.
+Распределённая блокировка берётся до входа в критическую секцию, а транзакция базы данных используется для атомарного чтения и сохранения.
+Нельзя держать блокировку дольше транзакции; освобождение выполняется в finally.
+При конфликте PostgreSQL exclusion constraint является последней защитой от двойного подтверждения. Ошибка ограничения преобразуется в 409 Conflict.
+
+8.9. Правила комнат
+
+Имя комнаты обязательно и уникально. Вместимость должна быть положительной. При деактивации комнаты новые брони запрещены, но исторические Booking сохраняются.
+Удаление комнаты физически не требуется; предпочтительно использовать active = false, чтобы не терять историю.
+
+8.10. Единый формат ошибок
+
+API возвращает JSON с полями code, message и timestamp.
+Основные коды: ROOM_NOT_FOUND (404), BOOKING_NOT_FOUND (404), ROOM_INACTIVE (409), SLOT_ALREADY_BOOKED (409), BOOKING_EXPIRED (410), ACCESS_DENIED (403), VALIDATION_ERROR (400). Ошибки валидации не должны доходить до слоя репозитория.
