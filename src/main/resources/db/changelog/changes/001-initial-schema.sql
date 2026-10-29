@@ -1,3 +1,6 @@
+--liquibase formatted sql
+
+--changeset meet-reserve:001-initial-schema
 -- таблица переговорных
 CREATE TABLE rooms (
     id BIGSERIAL PRIMARY KEY,

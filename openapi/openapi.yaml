@@ -74,6 +74,7 @@ components:
         startTime:
           type: string
           format: date-time
+          description: Время начала бронирования в будущем, с часовым поясом.
           example: '2026-11-01T14:00:00Z'
         endTime:
           type: string
@@ -106,6 +107,7 @@ components:
         expiresAt:
           type: string
           format: date-time
+          nullable: true
         createdAt:
           type: string
           format: date-time
